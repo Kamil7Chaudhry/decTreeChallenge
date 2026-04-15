@@ -1,0 +1,299 @@
+---
+title: "When Numbers Lie: How Encoding Kills Feature Importance"
+subtitle: "A Data Science Investigation Using the Ames Housing Dataset"
+author: "Kamil Chaudhry"
+format:
+  html:
+    toc: true
+    toc-depth: 2
+    theme: cosmo
+    echo: false
+    self-contained: true
+execute:
+  echo: false
+  warning: false
+  message: false
+---
+
+```{python}
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+from sklearn.tree import DecisionTreeRegressor, plot_tree
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import r2_score
+import warnings
+warnings.filterwarnings('ignore')
+
+sales_data = pd.read_csv("salesPriceData.csv")
+
+model_vars = ['SalePrice', 'LotArea', 'YearBuilt', 'GrLivArea', 'FullBath',
+              'HalfBath', 'BedroomAbvGr', 'TotRmsAbvGrd', 'GarageCars', 'zipCode']
+model_data = sales_data[model_vars].dropna()
+
+X = model_data.drop('SalePrice', axis=1)
+y = model_data['SalePrice']
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=123)
+
+tree_model = DecisionTreeRegressor(max_depth=3, min_samples_split=20,
+                                    min_samples_leaf=10, random_state=123)
+tree_model.fit(X_train, y_train)
+```
+
+---
+
+## The Question That Started This
+
+Every real estate agent will tell you the same thing: location is everything. So when I built a decision tree to predict home prices in Ames, Iowa, I expected zip code to show up as one of the most important features. Instead, it showed up with an importance score of zero.
+
+That result should not be trusted. Not because the data is wrong, but because the way zip code was fed into the model was wrong. This is an investigation into how a single encoding decision can make a genuinely important variable completely invisible to a machine learning model.
+
+---
+
+## The Full Model
+
+We start with nine predictors: lot area, year built, above-grade living area, full and half baths, bedrooms, total rooms, garage capacity, and zip code. Zip code is passed in as a raw integer — 50010, 50011, 50012, and so on.
+
+```{python}
+fig, ax = plt.subplots(figsize=(14, 6))
+plot_tree(tree_model,
+          feature_names=X_train.columns,
+          filled=True,
+          rounded=True,
+          fontsize=7,
+          max_depth=3,
+          ax=ax)
+ax.set_title("Decision Tree — Full Model (zipCode treated as numerical)", fontsize=13, pad=12)
+plt.tight_layout()
+plt.show()
+```
+
+The tree never splits on zip code. Not once. Every decision node belongs to living area, year built, garage capacity, or total rooms. Look at the feature importance chart below — zip code flatlines at zero.
+
+```{python}
+importance_df = pd.DataFrame({
+    'Feature': X_train.columns,
+    'Importance': tree_model.feature_importances_
+}).sort_values('Importance', ascending=True)
+
+fig, ax = plt.subplots(figsize=(8, 5))
+colors = ['#d62728' if imp > 0 else '#aec7e8' for imp in importance_df['Importance']]
+ax.barh(importance_df['Feature'], importance_df['Importance'], color=colors)
+ax.set_xlabel("Importance Score", fontsize=11)
+ax.set_title("Feature Importance — Full Model (zipCode as Numerical)", fontsize=12)
+plt.tight_layout()
+plt.show()
+```
+
+This should raise a red flag. The model did not crash. It produced clean output and a tidy importance chart. But the conclusion it is handing us — that location does not matter for home prices — is wrong. The problem is not in the data. It is in the encoding.
+
+---
+
+## Discussion Question 1: Should Zip Code Be Treated as a Number or a Category?
+
+**Zip code is a non-ordinal categorical variable. It must never be treated as a number.**
+
+A decision tree with numerical zip codes can only make splits like: "Is zipCode less than or equal to 50012.5?" That question means nothing for house prices. Zip code 50013 is not worth more than 50012 the way 2,000 square feet is worth more than 1,500. The numbers were assigned for postal routing. They carry no price signal on their own.
+
+What zip codes actually represent are discrete geographic neighborhoods. Each one is its own category — and some neighborhoods command higher prices than others regardless of what their postal number happens to be. That makes zip code non-ordinal: the categories exist and matter, but there is no natural ordering that connects them to house price.
+
+When you pass a non-ordinal categorical variable to a model as a number, the model will try to find a numerical threshold that separates high-price from low-price homes. That threshold does not exist, so the model assigns the variable zero importance and moves on. It is not wrong by its own logic — it just never had the chance to ask the right question.
+
+The scatter plot below shows what the model is missing.
+
+```{python}
+top_zips = sales_data['zipCode'].value_counts().head(6).index.tolist()
+
+fig, ax = plt.subplots(figsize=(9, 5))
+other_data = sales_data[~sales_data['zipCode'].isin(top_zips)]
+ax.scatter(other_data['GrLivArea'], other_data['SalePrice'],
+           color='lightgray', alpha=0.4, s=20, label='Other', zorder=1)
+
+markers = ['o', 's', '^', 'D', 'v', 'P']
+colors_zip = ['#e41a1c', '#377eb8', '#4daf4a', '#984ea3', '#ff7f00', '#a65628']
+for i, z in enumerate(top_zips):
+    zd = sales_data[sales_data['zipCode'] == z]
+    ax.scatter(zd['GrLivArea'], zd['SalePrice'],
+               color=colors_zip[i], marker=markers[i], alpha=0.75, s=35,
+               label=str(z), zorder=2)
+
+ax.set_xlabel("Above-Grade Living Area (sq ft)", fontsize=11)
+ax.set_ylabel("Sale Price ($)", fontsize=11)
+ax.set_title("Sale Price vs. Living Area by Zip Code", fontsize=12)
+ax.legend(title="Zip Code", fontsize=8, title_fontsize=9)
+ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f'${x:,.0f}'))
+plt.tight_layout()
+plt.show()
+```
+
+At 1,500 square feet, houses in different zip codes sell at dramatically different prices. Two identical homes, different neighborhoods, different values. That gap is real signal — and the numerical tree is completely blind to it.
+
+---
+
+## Isolating the Encoding Effect
+
+To confirm this is purely an encoding problem and not a signal problem, we strip the model down to just two predictors: living area and zip code. This removes every other competitor so zip code has a fair shot.
+
+```{python}
+X_simple_num = model_data[['GrLivArea', 'zipCode']]
+y_simple = model_data['SalePrice']
+X_train_sn, X_test_sn, y_train_sn, y_test_sn = train_test_split(
+    X_simple_num, y_simple, test_size=0.2, random_state=123)
+
+tree_simple_num = DecisionTreeRegressor(
+    max_depth=3, min_samples_split=20, min_samples_leaf=10, random_state=123)
+tree_simple_num.fit(X_train_sn, y_train_sn)
+r2_num = r2_score(y_test_sn, tree_simple_num.predict(X_test_sn))
+
+fig, ax = plt.subplots(figsize=(10, 5))
+plot_tree(tree_simple_num,
+          feature_names=['GrLivArea', 'zipCode'],
+          filled=True, rounded=True, fontsize=8, ax=ax)
+ax.set_title(f"Simplified Tree: GrLivArea + zipCode (Numerical) — Test R² = {r2_num:.4f}", fontsize=12)
+plt.tight_layout()
+plt.show()
+```
+
+Even with no competition, zip code barely appears. The tree splits almost exclusively on living area. This confirms the problem is the encoding, not the data.
+
+---
+
+## The Fix: One-Hot Encoding
+
+One-hot encoding converts each zip code into its own binary column. Instead of asking whether a zip code number is above or below some threshold, the tree can now ask: "Is this house in zip code 50027?" That is a question with a real answer that relates to price.
+
+```{python}
+top_zips_set = set(top_zips)
+zip_dummies = pd.get_dummies(
+    model_data['zipCode'].apply(lambda z: str(int(z)) if z in top_zips_set else 'Other'),
+    prefix='zip'
+)
+X_onehot = pd.concat([model_data[['GrLivArea']], zip_dummies], axis=1)
+X_train_oh, X_test_oh, y_train_oh, y_test_oh = train_test_split(
+    X_onehot, y_simple, test_size=0.2, random_state=123)
+
+tree_onehot = DecisionTreeRegressor(
+    max_depth=3, min_samples_split=20, min_samples_leaf=10, random_state=123)
+tree_onehot.fit(X_train_oh, y_train_oh)
+r2_oh = r2_score(y_test_oh, tree_onehot.predict(X_test_oh))
+
+fig, ax = plt.subplots(figsize=(12, 5))
+plot_tree(tree_onehot,
+          feature_names=X_train_oh.columns,
+          filled=True, rounded=True, fontsize=7, ax=ax)
+ax.set_title(f"Simplified Tree: GrLivArea + Zip Codes (One-Hot) — Test R² = {r2_oh:.4f}", fontsize=12)
+plt.tight_layout()
+plt.show()
+```
+
+```{python}
+imp_oh = pd.DataFrame({
+    'Feature': X_train_oh.columns,
+    'Importance': tree_onehot.feature_importances_
+}).sort_values('Importance', ascending=True)
+
+fig, ax = plt.subplots(figsize=(8, 5))
+bar_colors = ['#d62728' if 'zip' in f else '#1f77b4' for f in imp_oh['Feature']]
+ax.barh(imp_oh['Feature'], imp_oh['Importance'], color=bar_colors)
+ax.set_xlabel("Importance Score", fontsize=11)
+ax.set_title("Feature Importance — One-Hot Encoded Zip Codes", fontsize=12)
+red_patch = mpatches.Patch(color='#d62728', label='Zip code features')
+blue_patch = mpatches.Patch(color='#1f77b4', label='GrLivArea')
+ax.legend(handles=[red_patch, blue_patch], fontsize=9)
+plt.tight_layout()
+plt.show()
+```
+
+Now zip codes show up as real splits. The tree identifies zip code 50027 as a marker of a lower-priced neighborhood cluster. The variable that was invisible before is now contributing meaningfully, simply because we asked the model the right question.
+
+---
+
+## Discussion Question 2: R vs. Python — Which Does This Better?
+
+**R handles categorical variables in decision trees far better than Python's scikit-learn.**
+
+The reason comes down to how each implementation handles the CART algorithm. The scikit-learn documentation states directly:
+
+> "scikit-learn uses an optimized version of the CART algorithm; however, the scikit-learn implementation does not support categorical variables for now."
+
+That sentence is buried in the documentation, but its implications are serious. When you pass a categorical variable into scikit-learn's DecisionTreeRegressor, it does not warn you. It does not error. It silently converts everything to a float and proceeds as if the numbers are meaningful. The model runs, the importance chart looks clean, and you walk away with the wrong answer.
+
+R's rpart package handles this differently. When a column is declared as a factor — R's categorical data type — rpart considers every possible way to split the factor levels into two groups. For a zip code variable with seven unique values, that means evaluating splits like {50015, 50022} vs. {50024, 50027, 50013} — grouping neighborhoods together based on which combination best separates house prices. This is the statistically correct approach for a non-ordinal categorical variable.
+
+The practical consequence: run the same dataset in R with zip code declared as a factor, and zip code will likely appear as an important predictor grouped into meaningful neighborhood clusters. Run it in Python with scikit-learn, and zip code scores zero. Same data, same algorithm concept, completely different answer — because of how the two languages handle data types.
+
+For modelling categorical variables with decision trees, R gives you the right tool out of the box. Python requires you to know the limitation exists and work around it manually.
+
+---
+
+## Discussion Question 3: Can Python Split on Subsets of Zip Codes?
+
+**Yes — but you have to leave scikit-learn behind and use LightGBM.**
+
+LightGBM, developed by Microsoft, handles categorical variables natively using an algorithm that finds the optimal partition of categories into two subsets at each split. Instead of asking "is zip code less than 50012.5?" or "is this zip code 50027 yes or no?", it can ask "is this house in {50027, 50013} or in {50015, 50022, 50024}?" — discovering which groupings of zip codes actually separate prices, without any manual encoding.
+
+```{python}
+try:
+    import lightgbm as lgb
+
+    X_lgb = model_data[['GrLivArea', 'zipCode']].copy()
+    X_lgb['zipCode'] = X_lgb['zipCode'].astype('category')
+    y_lgb = model_data['SalePrice']
+
+    X_train_lgb, X_test_lgb, y_train_lgb, y_test_lgb = train_test_split(
+        X_lgb, y_lgb, test_size=0.2, random_state=123)
+
+    lgb_model = lgb.LGBMRegressor(
+        n_estimators=1,
+        max_depth=3,
+        num_leaves=8,
+        min_child_samples=10,
+        random_state=123,
+        verbose=-1
+    )
+    lgb_model.fit(X_train_lgb, y_train_lgb,
+                  categorical_feature=['zipCode'])
+
+    r2_lgb = r2_score(y_test_lgb, lgb_model.predict(X_test_lgb))
+
+    lgb_imp = pd.DataFrame({
+        'Feature': ['GrLivArea', 'zipCode'],
+        'Importance': lgb_model.feature_importances_
+    }).sort_values('Importance', ascending=True)
+
+    fig, ax = plt.subplots(figsize=(6, 3))
+    ax.barh(lgb_imp['Feature'], lgb_imp['Importance'],
+            color=['#1f77b4', '#d62728'])
+    ax.set_xlabel("Importance (split count)", fontsize=11)
+    ax.set_title(f"LightGBM — zipCode as Native Categorical\nTest R² = {r2_lgb:.4f}", fontsize=11)
+    plt.tight_layout()
+    plt.show()
+
+except ImportError:
+    print("Install LightGBM with: pip install lightgbm")
+```
+
+With LightGBM treating zip code as a proper categorical feature, the model evaluates neighborhood groupings rather than numerical thresholds. Zip code contributes real signal — exactly what we expected from the start, and what the scatter plot confirmed visually.
+
+The difference between one-hot encoding and LightGBM is subtle but important. One-hot encoding tells the tree which zip code each house is in, one binary flag at a time. LightGBM discovers which clusters of zip codes share pricing behavior automatically, without us engineering the groupings ourselves.
+
+Python can do this correctly. It just requires choosing the right package.
+
+---
+
+## What This Investigation Actually Shows
+
+The model never broke. It ran cleanly, produced a feature importance chart, and told a story. The problem is that the story was wrong — and nothing in the output flagged it.
+
+This is the real danger of encoding mistakes. They do not announce themselves. A categorical variable encoded as a number will silently contribute nothing to a decision tree, and you will walk away thinking location does not matter for house prices in Ames, Iowa. That conclusion would be embarrassing to defend to any client.
+
+Three things to take away from this:
+
+First, know your variable types before you model. Numerical-looking data — zip codes, survey IDs, product codes — is not always numerical in meaning. Ask what the numbers represent, not just what they look like.
+
+Second, use your domain knowledge as a sanity check. If your model says location does not matter for real estate, your model is wrong. Start by questioning your encoding, not your intuition.
+
+Third, pick tools that match your data. Scikit-learn's decision tree is powerful for numerical data. When categories matter, LightGBM, CatBoost, or R's rpart give you the correct implementation. Using the wrong tool does not produce an error — it just produces a quietly wrong answer.
+
+The features that matter in a model are not just a function of the data. They are a function of how you represent it.
